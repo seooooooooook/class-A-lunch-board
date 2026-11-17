@@ -1,0 +1,9 @@
+# 비밀 정보가 담긴 파일은 깃에 올리지 않아요
+.env
+backend/.env
+# 데이터베이스 파일 (학생 닉네임과 후기가 들어 있어요)
+backend/data/
+# 파이썬이 만드는 파일
+.venv/
+__pycache__/
+.pytest_cache/
