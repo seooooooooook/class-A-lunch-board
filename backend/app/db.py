@@ -9,11 +9,23 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 );
 
--- 학생: 이름 대신 닉네임만. token_hash 로 누구인지 구분해요.
+-- 학생 계정. 친구들에게는 닉네임만 보여요. 진짜 이름(real_name)은 선생님 화면에만 나와요.
+-- 예전(입장 코드) 방식으로 들어온 학생은 login_id 가 비어 있고, 다음에 들어올 때 계정을 만들어요.
 CREATE TABLE IF NOT EXISTS students (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    nickname    TEXT NOT NULL UNIQUE,
-    token_hash  TEXT NOT NULL UNIQUE,
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    nickname       TEXT NOT NULL UNIQUE,
+    login_id       TEXT UNIQUE,
+    password_hash  TEXT,
+    real_name      TEXT,
+    grade          INTEGER,
+    class_no       INTEGER,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 학생 로그인 기록. 기기마다 하나씩, 로그아웃하면 지워요.
+CREATE TABLE IF NOT EXISTS student_sessions (
+    token_hash  TEXT PRIMARY KEY,
+    student_id  INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -96,8 +108,58 @@ def connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    with connect() as conn:
+    conn = connect()
+    try:
+        migrate_students(conn)
         conn.executescript(SCHEMA)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_students(conn: sqlite3.Connection) -> None:
+    """입장 코드 시절 students 표(token_hash 칸)를 계정 표로 바꿔요.
+    학생 번호(id)는 그대로라서 별점·후기·좋아요·신고가 모두 남아요.
+    바꾸기 전에 lunch.db 를 lunch-before-accounts.db 로 한 벌 복사해 둬요."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(students)")}
+    if "token_hash" not in cols:
+        return
+    backup = db_path().with_name("lunch-before-accounts.db")
+    if not backup.exists():
+        dest = sqlite3.connect(backup)
+        conn.backup(dest)
+        dest.close()
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")  # 표를 바꾸는 동안 후기가 같이 지워지지 않게
+    try:
+        conn.executescript("""
+            BEGIN;
+            CREATE TABLE students_new (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                nickname       TEXT NOT NULL UNIQUE,
+                login_id       TEXT UNIQUE,
+                password_hash  TEXT,
+                real_name      TEXT,
+                grade          INTEGER,
+                class_no       INTEGER,
+                created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO students_new(id, nickname, created_at) SELECT id, nickname, created_at FROM students;
+            CREATE TABLE IF NOT EXISTS student_sessions (
+                token_hash  TEXT PRIMARY KEY,
+                student_id  INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT OR IGNORE INTO student_sessions(token_hash, student_id) SELECT token_hash, id FROM students;
+            DROP TABLE students;
+            ALTER TABLE students_new RENAME TO students;
+            COMMIT;
+        """)
+        broken = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if broken:
+            raise RuntimeError(f"학생 표를 바꾸다가 연결이 끊긴 기록이 {len(broken)}개 있어요. {backup} 로 되돌려 주세요.")
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
 
 
 def get_setting(conn: sqlite3.Connection, key: str, default: str | None = None) -> str | None:

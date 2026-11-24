@@ -23,19 +23,25 @@ def teacher(client):
     return auth(res.json()["token"])
 
 
+def signup(client, nick, login_id=None, real_name=None, class_name="5-1", password="pass1234"):
+    return client.post("/api/signup", json={
+        "class_name": class_name, "real_name": real_name or f"홍{nick[0]}동", "nickname": nick,
+        "login_id": login_id or f"kid{abs(hash(nick)) % 100000}", "password": password,
+    })
+
+
 @pytest.fixture()
 def setup(client, teacher):
-    """입장 코드 + 오늘 메뉴 2개 + 어제 메뉴 1개 + 학생 4명"""
-    code = client.post("/api/teacher/join-code", headers=teacher).json()["code"]
+    """오늘 메뉴 2개 + 어제 메뉴 1개 + 학생 4명"""
     today = client.put(f"/api/teacher/menus/{TODAY}", headers=teacher,
                        json={"menus": [{"name": "떡볶이", "source": "neis"}, {"name": "김치"}]}).json()["menus"]
     old = client.put(f"/api/teacher/menus/{YESTERDAY}", headers=teacher, json={"menus": [{"name": "카레"}]}).json()["menus"]
     students = {}
-    for nick in ["떡볶이왕", "김치왕", "라면왕", "만두왕"]:
-        res = client.post("/api/join", json={"code": code.lower(), "nickname": nick})
+    for i, nick in enumerate(["떡볶이왕", "김치왕", "라면왕", "만두왕"]):
+        res = signup(client, nick, login_id=f"kid{i}a", real_name=f"김학생{'가나다라'[i]}")
         assert res.status_code == 200, res.text
         students[nick] = auth(res.json()["token"])
-    return {"code": code, "menu": today[0]["id"], "menu2": today[1]["id"], "old": old[0]["id"], "s": students}
+    return {"menu": today[0]["id"], "menu2": today[1]["id"], "old": old[0]["id"], "s": students}
 
 
 def test_teacher_login(client):
@@ -43,16 +49,87 @@ def test_teacher_login(client):
     assert client.get("/api/teacher/students").status_code == 401
 
 
-def test_join_rules(client, teacher, setup):
-    assert client.post("/api/join", json={"code": "WRONG1", "nickname": "새친구"}).status_code == 403
-    assert client.post("/api/join", json={"code": setup["code"], "nickname": "김치왕"}).status_code == 409
-    assert client.post("/api/join", json={"code": setup["code"], "nickname": "바보"}).status_code == 400
-    assert client.post("/api/join", json={"code": setup["code"], "nickname": "가" * 11}).status_code == 400
+def test_signup_rules(client, teacher, setup):
+    ok = dict(class_name="5-2", real_name="이영희", nickname="새친구", login_id="newkid", password="abcd")
+    def try_(**kw):
+        return client.post("/api/signup", json={**ok, **kw})
+    assert try_(class_name="KIMCHI").status_code == 400
+    assert try_(class_name="7-1").status_code == 400
+    assert try_(class_name="5-0").status_code == 400
+    assert try_(nickname="김치왕").status_code == 409
+    assert try_(nickname="바보").status_code == 400
+    assert try_(nickname="가" * 11).status_code == 400
+    assert try_(nickname="영희짱").status_code == 400  # 닉네임에 진짜 이름
+    assert try_(real_name="1234").status_code == 400
+    assert try_(login_id="kid0a").status_code == 409
+    assert try_(login_id="한글아이디").status_code == 400
+    assert try_(password="abc").status_code == 400
+    res = try_(class_name=" 5 - 2 ", login_id="NewKid")
+    assert res.status_code == 200, res.text
+    assert res.json()["class_name"] == "5-2" and res.json()["login_id"] == "newkid"
+    assert "real_name" not in res.json()
+
+
+def test_allowed_classes(client, teacher):
+    assert client.put("/api/teacher/classes", headers=teacher, json={"classes": ["6-1", "5 -1", "5-1", ""]}).json() == {"classes": ["6-1", "5-1"]}
+    assert client.put("/api/teacher/classes", headers=teacher, json={"classes": ["A반"]}).status_code == 400
+    assert signup(client, "떡볶이왕", class_name="5-3").status_code == 403
+    assert signup(client, "떡볶이왕", class_name="5-1").status_code == 200
+    client.put("/api/teacher/classes", headers=teacher, json={"classes": []})
+    assert signup(client, "김치왕", class_name="4-7").status_code == 200
+
+
+def test_login_logout(client, setup):
+    assert client.post("/api/login", json={"login_id": "kid0a", "password": "wrong"}).status_code == 403
+    assert client.post("/api/login", json={"login_id": "nobody", "password": "pass1234"}).status_code == 403
+    res = client.post("/api/login", json={"login_id": " KID0A ", "password": "pass1234"})
+    assert res.status_code == 200 and res.json()["nickname"] == "떡볶이왕"
+    phone = auth(res.json()["token"])
+    laptop = setup["s"]["떡볶이왕"]
+    assert client.get("/api/me", headers=phone).json()["needs_account"] is False
+    # 한 기기에서 로그아웃해도 다른 기기는 그대로
+    assert client.post("/api/logout", headers=phone).status_code == 200
+    assert client.get("/api/me", headers=phone).status_code == 401
+    assert client.get("/api/me", headers=laptop).status_code == 200
+    assert client.post("/api/logout").status_code == 401
+
+
+def test_login_lock_after_many_fails(client, setup):
+    for _ in range(5):
+        client.post("/api/login", json={"login_id": "kid1a", "password": "nope"})
+    assert client.post("/api/login", json={"login_id": "kid1a", "password": "pass1234"}).status_code == 429
+    main._login_fails.clear()
+    assert client.post("/api/login", json={"login_id": "kid1a", "password": "pass1234"}).status_code == 200
+
+
+def test_real_name_only_for_teacher(client, teacher, setup):
+    s = setup["s"]
+    client.put(f"/api/menus/{setup['menu']}/review", headers=s["떡볶이왕"], json={"stars": 5, "comment": "맛있어요"})
+    for path in ["/api/me", f"/api/days/{TODAY}"]:
+        assert "김학생" not in client.get(path, headers=s["김치왕"]).text
+        assert "김학생" not in client.get(path, headers=s["떡볶이왕"]).text
+    students = client.get("/api/teacher/students", headers=teacher).json()["students"]
+    me = next(x for x in students if x["nickname"] == "떡볶이왕")
+    assert me["real_name"] == "김학생가" and me["class_name"] == "5-1" and me["login_id"] == "kid0a"
+    assert "password_hash" not in me
+    reviews = client.get(f"/api/teacher/reviews?mode=date&date={TODAY}", headers=teacher).json()["reviews"]
+    assert reviews[0]["real_name"] == "김학생가" and reviews[0]["class_name"] == "5-1"
+
+
+def test_teacher_resets_password(client, teacher, setup):
+    sid = next(x["id"] for x in client.get("/api/teacher/students", headers=teacher).json()["students"] if x["login_id"] == "kid2a")
+    assert client.put(f"/api/teacher/students/{sid}/password", headers=teacher, json={"password": "ab"}).status_code == 400
+    assert client.put(f"/api/teacher/students/{sid}/password", headers=setup["s"]["김치왕"], json={"password": "new1"}).status_code == 401
+    assert client.put(f"/api/teacher/students/{sid}/password", headers=teacher, json={"password": "new1"}).status_code == 200
+    assert client.get("/api/me", headers=setup["s"]["라면왕"]).status_code == 401  # 로그인 풀림
+    assert client.post("/api/login", json={"login_id": "kid2a", "password": "pass1234"}).status_code == 403
+    assert client.post("/api/login", json={"login_id": "kid2a", "password": "new1"}).status_code == 200
 
 
 def test_students_cannot_use_teacher_api(client, setup):
     s = setup["s"]["떡볶이왕"]
-    assert client.get("/api/teacher/join-code", headers=s).status_code == 401
+    assert client.get("/api/teacher/classes", headers=s).status_code == 401
+    assert client.get("/api/teacher/students", headers=s).status_code == 401
     assert client.put(f"/api/teacher/menus/{TODAY}", headers=s, json={"menus": []}).status_code == 401
 
 

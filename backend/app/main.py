@@ -10,7 +10,9 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
+import time
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -96,12 +98,23 @@ def extra_banned_words(conn) -> list[str]:
     return json.loads(get_setting(conn, "banned_words", "[]"))
 
 
-def current_student(db: Db, authorization: Annotated[str | None, Header()] = None) -> sqlite3.Row:
+def session_student(db: Db, authorization: Annotated[str | None, Header()] = None) -> sqlite3.Row:
+    """로그인한 학생 (예전 방식으로 들어와 아직 계정을 만들지 않은 학생도 포함)."""
     token = bearer(authorization)
-    row = token and db.execute("SELECT * FROM students WHERE token_hash = ?", (hash_token(token),)).fetchone()
+    row = token and db.execute(
+        """SELECT s.* FROM student_sessions ss JOIN students s ON s.id = ss.student_id
+           WHERE ss.token_hash = ?""",
+        (hash_token(token),),
+    ).fetchone()
     if not row:
-        fail(401, "반 입장 코드를 넣고 다시 들어와 주세요.")
+        fail(401, "다시 로그인해 주세요.")
     return row
+
+
+def current_student(student: Annotated[sqlite3.Row, Depends(session_student)]) -> sqlite3.Row:
+    if not student["login_id"]:
+        fail(403, "먼저 아이디와 비밀번호를 만들어 주세요.")
+    return student
 
 
 def current_teacher(db: Db, authorization: Annotated[str | None, Header()] = None) -> None:
@@ -112,44 +125,191 @@ def current_teacher(db: Db, authorization: Annotated[str | None, Header()] = Non
 
 
 Student = Annotated[sqlite3.Row, Depends(current_student)]
+SessionStudent = Annotated[sqlite3.Row, Depends(session_student)]
 Teacher = Annotated[None, Depends(current_teacher)]
 
 
-# ---------------------------------------------------------------- 학생: 입장
+# ---------------------------------------------------------------- 학생: 회원가입 · 로그인 · 로그아웃
 
-class JoinIn(BaseModel):
-    code: str
-    nickname: str
+LOGIN_ID_RE = re.compile(r"^[a-z0-9]{4,12}$")
+REAL_NAME_RE = re.compile(r"^[가-힣A-Za-z]{2,10}$")
+CLASS_RE = re.compile(r"^([1-6])\s*[-–—~.]\s*(\d{1,2})$")
+PASSWORD_MIN, PASSWORD_MAX = 4, 30
+PBKDF2_ROUNDS = 200_000
+LOGIN_FAILS_TO_LOCK, LOGIN_LOCK_SECONDS = 5, 60
+_login_fails: dict[str, tuple[int, float]] = {}  # 아이디 → (틀린 횟수, 잠금이 풀리는 시각)
 
 
-@app.post("/api/join")
-def join(body: JoinIn, db: Db):
-    code = body.code.strip().upper()
-    nickname = " ".join(body.nickname.split())
-    if not code:
-        fail(400, "반 입장 코드를 넣어 주세요.")
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_ROUNDS)
+    return f"pbkdf2_sha256${PBKDF2_ROUNDS}${salt.hex()}${digest.hex()}"
+
+
+def check_password(password: str, stored: str | None) -> bool:
+    try:
+        _, rounds, salt, digest = (stored or "").split("$")
+        mine = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), int(rounds))
+    except ValueError:
+        return False
+    return hmac.compare_digest(mine.hex(), digest)
+
+
+def parse_class(text: str) -> tuple[int, int]:
+    """'5-1', '5 - 1' → (5, 1). 선생님이 받을 반을 정해 두었으면 그 반만 받아요."""
+    m = CLASS_RE.match((text or "").strip())
+    if not m or not 1 <= int(m.group(2)) <= 20:
+        fail(400, "학년-반을 '5-1'처럼 숫자로 써 주세요.")
+    return int(m.group(1)), int(m.group(2))
+
+
+def class_label(grade, class_no) -> str | None:
+    return f"{grade}-{class_no}" if grade and class_no else None
+
+
+def check_password_rule(password: str) -> None:
+    if not PASSWORD_MIN <= len(password) <= PASSWORD_MAX:
+        fail(400, f"비밀번호는 {PASSWORD_MIN}~{PASSWORD_MAX}글자로 써 주세요.")
+
+
+def clean_real_name(name: str) -> str:
+    name = "".join((name or "").split())
+    if not REAL_NAME_RE.match(name):
+        fail(400, "진짜 이름을 한글 2~10글자로 써 주세요.")
+    return name
+
+
+def clean_nickname(db, nickname: str, real_name: str | None = None) -> str:
+    nickname = " ".join((nickname or "").split())
     if not 1 <= len(nickname) <= NICKNAME_MAX:
         fail(400, f"닉네임은 1~{NICKNAME_MAX}글자로 써 주세요.")
     problem = check_text(nickname, extra_banned_words(db))
     if problem:
         fail(400, MESSAGES[problem])
+    if real_name and (real_name in "".join(nickname.split()) or (len(real_name) >= 3 and real_name[1:] in nickname)):
+        fail(400, "닉네임에 진짜 이름을 쓰지 말아 주세요. 친구들이 볼 수 있어요.")
+    return nickname
 
-    join_code = (get_setting(db, "join_code") or "").upper()
-    if not join_code:
-        fail(409, "선생님이 아직 입장 코드를 만들지 않았어요.")
-    if not hmac.compare_digest(code, join_code):
-        fail(403, "입장 코드가 맞지 않아요. 선생님께 다시 확인해 주세요.")
+
+def clean_login_id(db, login_id: str, me: int | None = None) -> str:
+    login_id = (login_id or "").strip().lower()
+    if not LOGIN_ID_RE.match(login_id):
+        fail(400, "아이디는 영어 소문자와 숫자로 4~12글자로 써 주세요.")
+    row = db.execute("SELECT id FROM students WHERE login_id = ?", (login_id,)).fetchone()
+    if row and row["id"] != me:
+        fail(409, "이미 있는 아이디예요. 다른 아이디를 골라 주세요.")
+    return login_id
+
+
+def allowed_classes(db) -> list[str]:
+    return json.loads(get_setting(db, "allowed_classes", "[]"))
+
+
+def check_class(db, text: str) -> tuple[int, int]:
+    grade, class_no = parse_class(text)
+    allowed = allowed_classes(db)
+    if allowed and f"{grade}-{class_no}" not in allowed:
+        fail(403, "우리 반 학년-반이 아니에요. 선생님께 다시 확인해 주세요.")
+    return grade, class_no
+
+
+def new_session(db, student_id: int) -> str:
+    token = secrets.token_urlsafe(32)
+    db.execute("INSERT INTO student_sessions(token_hash, student_id) VALUES(?, ?)", (hash_token(token), student_id))
+    return token
+
+
+def me_info(row) -> dict:
+    """학생 본인에게 보내는 정보. 진짜 이름은 넣지 않아요 (같은 기기를 친구가 볼 수도 있어서)."""
+    return {
+        "nickname": row["nickname"],
+        "class_name": class_label(row["grade"], row["class_no"]),
+        "login_id": row["login_id"],
+        "needs_account": not row["login_id"],
+    }
+
+
+class SignupIn(BaseModel):
+    class_name: str = Field(max_length=10)
+    real_name: str = Field(max_length=20)
+    nickname: str = Field(max_length=30)
+    login_id: str = Field(max_length=30)
+    password: str = Field(max_length=100)
+
+
+@app.post("/api/signup")
+def signup(body: SignupIn, db: Db):
+    grade, class_no = check_class(db, body.class_name)
+    real_name = clean_real_name(body.real_name)
+    nickname = clean_nickname(db, body.nickname, real_name)
+    login_id = clean_login_id(db, body.login_id)
+    check_password_rule(body.password)
     if db.execute("SELECT 1 FROM students WHERE nickname = ?", (nickname,)).fetchone():
         fail(409, "이미 다른 친구가 쓰는 닉네임이에요. 다른 닉네임을 골라 주세요.")
+    cur = db.execute(
+        """INSERT INTO students(nickname, login_id, password_hash, real_name, grade, class_no)
+           VALUES(?, ?, ?, ?, ?, ?)""",
+        (nickname, login_id, hash_password(body.password), real_name, grade, class_no),
+    )
+    token = new_session(db, cur.lastrowid)
+    row = db.execute("SELECT * FROM students WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return {"token": token, **me_info(row)}
 
-    token = secrets.token_urlsafe(32)
-    db.execute("INSERT INTO students(nickname, token_hash) VALUES(?, ?)", (nickname, hash_token(token)))
-    return {"token": token, "nickname": nickname}
+
+class StudentLoginIn(BaseModel):
+    login_id: str = Field(max_length=30)
+    password: str = Field(max_length=100)
+
+
+@app.post("/api/login")
+def student_login(body: StudentLoginIn, db: Db):
+    login_id = body.login_id.strip().lower()
+    fails, locked_until = _login_fails.get(login_id, (0, 0.0))
+    if locked_until > time.monotonic():
+        fail(429, "비밀번호를 여러 번 틀렸어요. 1분 뒤에 다시 해 주세요.")
+    row = db.execute("SELECT * FROM students WHERE login_id = ?", (login_id,)).fetchone()
+    if not row or not check_password(body.password, row["password_hash"]):
+        fails += 1
+        _login_fails[login_id] = (0, time.monotonic() + LOGIN_LOCK_SECONDS) if fails >= LOGIN_FAILS_TO_LOCK else (fails, 0.0)
+        fail(403, "아이디나 비밀번호가 맞지 않아요. 잊어버렸으면 선생님께 말해 주세요.")
+    _login_fails.pop(login_id, None)
+    return {"token": new_session(db, row["id"]), **me_info(row)}
+
+
+@app.post("/api/logout")
+def student_logout(_: SessionStudent, db: Db, authorization: Annotated[str | None, Header()] = None):
+    db.execute("DELETE FROM student_sessions WHERE token_hash = ?", (hash_token(bearer(authorization)),))
+    return {"ok": True}
 
 
 @app.get("/api/me")
-def me(student: Student):
-    return {"nickname": student["nickname"]}
+def me(student: SessionStudent):
+    return me_info(student)
+
+
+class AccountIn(BaseModel):
+    class_name: str = Field(max_length=10)
+    real_name: str = Field(max_length=20)
+    login_id: str = Field(max_length=30)
+    password: str = Field(max_length=100)
+
+
+@app.post("/api/me/account")
+def make_account(body: AccountIn, student: SessionStudent, db: Db):
+    """예전에 입장 코드로 들어온 학생이 지금 닉네임 그대로 아이디·비밀번호를 만들어요. 별점·후기는 그대로예요."""
+    if student["login_id"]:
+        fail(409, "이미 계정이 있어요.")
+    grade, class_no = check_class(db, body.class_name)
+    real_name = clean_real_name(body.real_name)
+    login_id = clean_login_id(db, body.login_id, student["id"])
+    check_password_rule(body.password)
+    db.execute(
+        """UPDATE students SET login_id = ?, password_hash = ?, real_name = ?, grade = ?, class_no = ?
+           WHERE id = ?""",
+        (login_id, hash_password(body.password), real_name, grade, class_no, student["id"]),
+    )
+    row = db.execute("SELECT * FROM students WHERE id = ?", (student["id"],)).fetchone()
+    return me_info(row)
 
 
 # ---------------------------------------------------------------- 학생: 오늘의 급식
@@ -375,7 +535,9 @@ def teacher_reviews(
     mode: Literal["flagged", "date"] = "flagged",
     date: Annotated[str | None, Query(pattern=r"^\d{4}-\d{2}-\d{2}$")] = None,
 ):
-    sql = """SELECT r.id, m.date, m.name AS menu, s.nickname, r.stars, r.comment,
+    sql = """SELECT r.id, m.date, m.name AS menu, s.nickname, s.real_name,
+                    CASE WHEN s.grade IS NOT NULL THEN s.grade || '-' || s.class_no END AS class_name,
+                    r.stars, r.comment,
                     r.report_count, r.hidden, r.hidden_by, r.updated_at
              FROM reviews r JOIN menus m ON m.id = r.menu_id JOIN students s ON s.id = r.student_id"""
     if mode == "date":
@@ -435,27 +597,59 @@ def remove_word(word: str, _: Teacher, db: Db):
     return {"words": words}
 
 
-# ---------------------------------------------------------------- 선생님: 입장 코드와 학생
+# ---------------------------------------------------------------- 선생님: 우리 반과 학생
 
-CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # 헷갈리는 0/O, 1/I/L 은 빼요
-
-
-@app.get("/api/teacher/join-code")
-def get_join_code(_: Teacher, db: Db):
-    return {"code": get_setting(db, "join_code")}
+class ClassesIn(BaseModel):
+    classes: list[str] = Field(max_length=30)
 
 
-@app.post("/api/teacher/join-code")
-def new_join_code(_: Teacher, db: Db):
-    code = "".join(secrets.choice(CODE_CHARS) for _ in range(6))
-    set_setting(db, "join_code", code)
-    return {"code": code}
+@app.get("/api/teacher/classes")
+def get_classes(_: Teacher, db: Db):
+    return {"classes": allowed_classes(db)}
+
+
+@app.put("/api/teacher/classes")
+def save_classes(body: ClassesIn, _: Teacher, db: Db):
+    """가입을 받을 학년-반. 비워 두면 1~6학년 어느 반이든 받아요."""
+    labels = []
+    for text in body.classes:
+        if not text.strip():
+            continue
+        label = "-".join(map(str, parse_class(text)))
+        if label not in labels:
+            labels.append(label)
+    set_setting(db, "allowed_classes", json.dumps(labels))
+    return {"classes": labels}
 
 
 @app.get("/api/teacher/students")
 def students(_: Teacher, db: Db):
-    rows = db.execute("SELECT id, nickname, created_at FROM students ORDER BY nickname").fetchall()
-    return {"students": [dict(r) for r in rows]}
+    """선생님만 보는 학생 목록. 여기에만 진짜 이름이 나와요."""
+    rows = db.execute(
+        """SELECT id, nickname, login_id, real_name, grade, class_no, created_at FROM students
+           ORDER BY grade IS NULL, grade, class_no, real_name, nickname"""
+    ).fetchall()
+    return {"students": [{
+        "id": r["id"], "nickname": r["nickname"], "login_id": r["login_id"], "real_name": r["real_name"],
+        "class_name": class_label(r["grade"], r["class_no"]), "has_account": bool(r["login_id"]),
+        "created_at": r["created_at"],
+    } for r in rows]}
+
+
+class PasswordIn(BaseModel):
+    password: str = Field(max_length=100)
+
+
+@app.put("/api/teacher/students/{student_id}/password")
+def reset_password(student_id: int, body: PasswordIn, _: Teacher, db: Db):
+    """비밀번호를 잊은 학생에게 새 비밀번호를 정해 줘요. 다른 기기의 로그인은 모두 풀려요."""
+    check_password_rule(body.password)
+    cur = db.execute("UPDATE students SET password_hash = ? WHERE id = ? AND login_id IS NOT NULL",
+                     (hash_password(body.password), student_id))
+    if cur.rowcount == 0:
+        fail(404, "계정이 있는 학생이 아니에요.")
+    db.execute("DELETE FROM student_sessions WHERE student_id = ?", (student_id,))
+    return {"ok": True}
 
 
 class NicknameIn(BaseModel):

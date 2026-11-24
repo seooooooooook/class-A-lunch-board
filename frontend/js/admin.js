@@ -1,4 +1,4 @@
-// 선생님 화면: 메뉴 확인·수정(나이스는 서버가 매일 자동으로 불러와요) · 후기 관리 · 학생과 입장 코드
+// 선생님 화면: 메뉴 확인·수정(나이스는 서버가 매일 자동으로 불러와요) · 후기 관리 · 학생(진짜 이름)과 우리 반
 import { api, getToken, setToken } from "./api.js";
 import { todayKst, prettyDate, average, el, starText, toast } from "./util.js";
 
@@ -7,7 +7,7 @@ const whoEl = document.getElementById("who");
 const TABS = [
   { id: "menus", label: "메뉴" },
   { id: "reviews", label: "후기 관리" },
-  { id: "class", label: "학생 · 입장 코드" },
+  { id: "class", label: "학생 · 우리 반" },
 ];
 let currentTab = "menus";
 
@@ -187,7 +187,7 @@ function renderReviews(box) {
       ),
       el("p", {}, r.comment || "(별점만)"),
       el("p", { class: "hint" },
-        `${r.nickname} · 신고 ${r.report_count}회`,
+        `${r.nickname}${r.real_name ? ` (${r.class_name ? r.class_name + " " : ""}${r.real_name})` : ""} · 신고 ${r.report_count}회`,
         r.hidden ? ` · ${HIDDEN_BY[r.hidden_by] || "숨김"}` : ""),
       el("div", { class: "form-row" },
         r.hidden
@@ -244,50 +244,67 @@ function renderReviews(box) {
   safe(() => call("/api/teacher/banned-words")).then((res) => drawWords(res.words), () => {});
 }
 
-// ---------- 3. 학생 · 입장 코드 ----------
+// ---------- 3. 학생 · 우리 반 ----------
 
 function renderClass(box) {
-  const codeBox = el("div");
+  const classBox = el("div");
   const listEl = el("div");
 
-  function drawCode(code) {
-    codeBox.replaceChildren(
-      el("h3", {}, "반 입장 코드"),
-      el("p", { class: "code" }, code || "아직 없어요"),
-      el("p", { class: "hint" }, "칠판에 써 주세요. 새 코드를 만들면 이미 들어온 친구는 그대로이고, 새로 들어올 친구만 새 코드를 써야 해요."),
-      el("button", { class: "btn", onclick: async () => {
-        if (code && !confirm("새 입장 코드를 만들까요?")) return;
-        const res = await safe(() => call("/api/teacher/join-code", { method: "POST" }));
-        drawCode(res.code);
-      } }, code ? "새 코드 만들기" : "코드 만들기"),
+  function drawClasses(classes) {
+    const input = el("input", { value: classes.join(", "), placeholder: "예: 5-1, 6-1", "aria-label": "가입을 받을 학년-반" });
+    classBox.replaceChildren(
+      el("h3", {}, "가입을 받을 학년-반"),
+      el("p", { class: "hint" }, "학생은 회원가입할 때 학년-반(예: 5-1)과 진짜 이름을 넣어요. 여기에 적은 반만 가입할 수 있어요. 비워 두면 1~6학년 어느 반이든 가입할 수 있어요."),
+      el("form", { class: "form-row", onsubmit: async (e) => {
+        e.preventDefault();
+        const list = input.value.split(/[,\s]+/).filter(Boolean);
+        const res = await safe(() => call("/api/teacher/classes", { method: "PUT", body: { classes: list } }));
+        toast(res.classes.length ? `${res.classes.join(", ")} 반만 가입할 수 있어요.` : "어느 반이든 가입할 수 있어요.");
+        drawClasses(res.classes);
+      } }, input, el("button", { class: "btn", type: "submit" }, "저장")),
     );
   }
 
   async function loadStudents() {
     const { students } = await safe(() => call("/api/teacher/students"));
-    listEl.replaceChildren(
-      el("h3", {}, `들어온 학생 ${students.length}명`),
-      el("p", { class: "hint" }, "닉네임에 진짜 이름이 들어가 있으면 바꿔 주세요."),
-      students.length === 0 ? el("p", { class: "empty small" }, "아직 아무도 안 들어왔어요.") :
+    const waiting = students.filter((s) => !s.has_account).length;
+    listEl.replaceChildren(...[
+      el("h3", {}, `가입한 학생 ${students.length}명`),
+      el("p", { class: "hint" }, "🔒 진짜 이름과 아이디는 이 선생님 화면에만 나와요. 친구들에게는 닉네임만 보여요. 닉네임에 진짜 이름이 들어가 있으면 바꿔 주세요."),
+      waiting ? el("p", { class: "notice" }, `예전 입장 코드로 들어온 학생 ${waiting}명은 다음에 들어올 때 아이디·비밀번호와 진짜 이름을 넣게 돼요.`) : null,
+      students.length === 0 ? el("p", { class: "empty small" }, "아직 아무도 가입하지 않았어요.") :
       el("ul", { class: "students" }, students.map((s) => el("li", {},
-        el("span", {}, s.nickname),
-        el("button", { class: "btn", onclick: async () => {
-          const next = (prompt("새 닉네임 (10자 이내)", s.nickname) || "").trim();
-          if (!next || next === s.nickname) return;
-          await safe(() => call(`/api/teacher/students/${s.id}`, { method: "PATCH", body: { nickname: next } }));
-          toast("바꿨어요.");
-          loadStudents();
-        } }, "닉네임 바꾸기"),
-        el("button", { class: "btn ghost", onclick: async () => {
-          if (!confirm(`${s.nickname} 학생을 내보낼까요? 이 학생의 별점과 후기도 지워지고, 다시 입장 코드를 넣어야 해요.`)) return;
-          await safe(() => call(`/api/teacher/students/${s.id}`, { method: "DELETE" }));
-          loadStudents();
-        } }, "내보내기"),
+        el("div", { class: "student-info" },
+          el("strong", {}, s.real_name || "(이름 아직 없음)"),
+          el("span", { class: "tag" }, s.class_name || "반 미정"),
+          el("span", {}, ` 닉네임 ${s.nickname}`),
+          el("span", { class: "hint" }, s.login_id ? `아이디 ${s.login_id}` : "아직 계정 없음"),
+        ),
+        el("div", { class: "form-row" },
+          el("button", { class: "btn", onclick: async () => {
+            const next = (prompt("새 닉네임 (10자 이내)", s.nickname) || "").trim();
+            if (!next || next === s.nickname) return;
+            await safe(() => call(`/api/teacher/students/${s.id}`, { method: "PATCH", body: { nickname: next } }));
+            toast("바꿨어요.");
+            loadStudents();
+          } }, "닉네임 바꾸기"),
+          s.has_account ? el("button", { class: "btn", onclick: async () => {
+            const pw = (prompt(`${s.real_name || s.nickname} 학생의 새 비밀번호 (4글자 이상)`) || "").trim();
+            if (!pw) return;
+            await safe(() => call(`/api/teacher/students/${s.id}/password`, { method: "PUT", body: { password: pw } }));
+            toast("새 비밀번호를 정했어요. 학생에게 알려 주세요.");
+          } }, "비밀번호 새로 정하기") : null,
+          el("button", { class: "btn ghost", onclick: async () => {
+            if (!confirm(`${s.real_name || s.nickname} 학생을 내보낼까요? 이 학생의 계정과 별점·후기가 모두 지워져요.`)) return;
+            await safe(() => call(`/api/teacher/students/${s.id}`, { method: "DELETE" }));
+            loadStudents();
+          } }, "내보내기"),
+        ),
       ))),
-    );
+    ].filter(Boolean));
   }
 
-  box.replaceChildren(el("h2", {}, "학생 · 입장 코드"), codeBox, el("hr"), listEl);
-  safe(() => call("/api/teacher/join-code")).then((res) => drawCode(res.code), () => {});
+  box.replaceChildren(el("h2", {}, "학생 · 우리 반"), classBox, el("hr"), listEl);
+  safe(() => call("/api/teacher/classes")).then((res) => drawClasses(res.classes), () => {});
   loadStudents().catch(() => {});
 }

@@ -1,4 +1,4 @@
-// 학생 화면: 반 입장 → 오늘의 급식 → 메뉴 상세
+// 학생 화면: 로그인·회원가입 → 오늘의 급식 → 메뉴 상세
 import { api, getToken, setToken } from "./api.js";
 import { todayKst, addDays, prettyDate, isWeekend, el, starText, toast } from "./util.js";
 
@@ -30,64 +30,160 @@ let pollTimer = null;
 start();
 
 async function start() {
-  if (!getToken("student")) return showJoin();
+  if (!getToken("student")) return showHome();
   try {
     const me = await api("student", "/api/me");
     state.nickname = me.nickname;
+    if (me.needs_account) return showMakeAccount();
     showMain();
   } catch (err) {
     if (err.status === 401) setToken("student", null);
-    showJoin(err.status === 401 ? "" : err.message);
+    showHome("login", err.status === 401 ? "" : err.message);
   }
 }
 
-// ---------- 1. 입장 화면 ----------
+async function logout() {
+  if (!confirm("로그아웃할까요?")) return;
+  await api("student", "/api/logout", { method: "POST" }).catch(() => {});
+  setToken("student", null);
+  state.nickname = null;
+  if (dialogEl.open) dialogEl.close();
+  showHome("login");
+}
 
-function showJoin(message = "") {
-  whoEl.hidden = true;
-  stopPolling();
-  const code = el("input", { id: "code", name: "code", autocomplete: "off", required: true, maxlength: 12, placeholder: "예: KIMCHI", autocapitalize: "characters" });
-  const nick = el("input", { id: "nick", name: "nick", autocomplete: "off", required: true, maxlength: 10, placeholder: "예: 떡볶이왕" });
-  const err = el("p", { class: "error", role: "alert" }, message);
-  const btn = el("button", { class: "btn primary big", type: "submit" }, "입장하기");
+function showWho() {
+  whoEl.hidden = false;
+  whoEl.replaceChildren(`🙂 ${state.nickname} `, el("button", { class: "btn link", type: "button", onclick: logout }, "로그아웃"));
+}
 
-  const form = el("form", { class: "panel join", onsubmit: onJoin },
-    el("h2", {}, "우리 반 급식 평가판에 들어가요"),
-    el("label", { for: "code" }, "반 입장 코드"), code,
-    el("label", { for: "nick" }, "닉네임"), nick,
-    el("p", { class: "hint" }, "진짜 이름 말고 별명을 써 주세요. 처음 한 번만 넣으면 다음부터는 기억해요."),
-    el("div", { class: "rules" },
-      el("h3", {}, "이용 규칙"),
-      el("ol", {}, RULES.map((r) => el("li", {}, r))),
-    ),
-    err, btn,
+// ---------- 1. 홈: 로그인 · 회원가입 ----------
+
+function field(id, label, props = {}) {
+  const input = el("input", { id, name: id, autocomplete: "off", required: true, ...props });
+  return { input, nodes: [el("label", { for: id }, label), input] };
+}
+
+function rulesBox() {
+  return el("div", { class: "rules" },
+    el("h3", {}, "이용 규칙"),
+    el("ol", {}, RULES.map((r) => el("li", {}, r))),
   );
-  appEl.replaceChildren(form);
+}
 
-  async function onJoin(e) {
+// 버튼을 누르는 동안 "확인하는 중…" 으로 바꾸고, 틀리면 빨간 글로 알려줘요.
+function submitter(btn, err, label, fn) {
+  return async (e) => {
     e.preventDefault();
     err.textContent = "";
     btn.disabled = true;
     btn.textContent = "확인하는 중…";
     try {
-      const res = await api(null, "/api/join", { method: "POST", body: { code: code.value, nickname: nick.value } });
-      setToken("student", res.token);
-      state.nickname = res.nickname;
-      showMain();
+      await fn();
     } catch (ex) {
       err.textContent = ex.message;
     } finally {
       btn.disabled = false;
-      btn.textContent = "입장하기";
+      btn.textContent = label;
     }
-  }
+  };
+}
+
+function signedIn(res) {
+  setToken("student", res.token);
+  state.nickname = res.nickname;
+  showMain();
+}
+
+function showHome(mode = "login", message = "") {
+  whoEl.hidden = true;
+  stopPolling();
+  const tabs = el("nav", { class: "tabs", role: "tablist" },
+    [["login", "로그인"], ["signup", "회원가입"]].map(([id, label]) =>
+      el("button", { class: `tab${id === mode ? " on" : ""}`, role: "tab", type: "button", "aria-selected": String(id === mode), onclick: () => showHome(id) }, label)));
+  appEl.replaceChildren(tabs, mode === "login" ? loginForm(message) : signupForm(message));
+}
+
+function loginForm(message) {
+  const id = field("login-id", "아이디", { maxlength: 12, autocomplete: "username", autocapitalize: "off" });
+  const pw = field("login-pw", "비밀번호", { type: "password", maxlength: 30, autocomplete: "current-password" });
+  const err = el("p", { class: "error", role: "alert" }, message);
+  const btn = el("button", { class: "btn primary big", type: "submit" }, "로그인");
+  return el("form", { class: "panel join", onsubmit: submitter(btn, err, "로그인", async () => {
+    signedIn(await api(null, "/api/login", { method: "POST", body: { login_id: id.input.value, password: pw.input.value } }));
+  }) },
+    el("h2", {}, "우리 반 급식 평가판"),
+    ...id.nodes, ...pw.nodes,
+    err, btn,
+    el("p", { class: "hint" }, "처음이면 위의 회원가입을 눌러요. 비밀번호를 잊어버렸으면 선생님께 말해 주세요."),
+  );
+}
+
+// 회원가입과 '계정 만들기'에 같이 쓰는 칸: 학년-반, 진짜 이름, 아이디, 비밀번호
+function accountFields() {
+  const cls = field("class", "학년-반", { maxlength: 5, placeholder: "예: 5-1", pattern: "\\s*[1-6]\\s*-\\s*\\d{1,2}\\s*", title: "5-1 처럼 학년과 반을 숫자로 써 주세요" });
+  const real = field("real-name", "진짜 이름", { maxlength: 10, placeholder: "예: 김하안" });
+  const id = field("new-id", "아이디", { maxlength: 12, autocomplete: "username", autocapitalize: "off", placeholder: "영어 소문자와 숫자 4~12글자", pattern: "[A-Za-z0-9]{4,12}", title: "영어와 숫자로 4~12글자" });
+  const pw = field("new-pw", "비밀번호", { type: "password", minlength: 4, maxlength: 30, autocomplete: "new-password", placeholder: "4글자 이상" });
+  const pw2 = field("new-pw2", "비밀번호 한 번 더", { type: "password", minlength: 4, maxlength: 30, autocomplete: "new-password" });
+  const privacy = el("p", { class: "notice" }, "🔒 진짜 이름은 선생님만 볼 수 있어요. 친구들에게는 닉네임만 보여요.");
+  return {
+    cls, real, id, pw,
+    top: [...cls.nodes, ...real.nodes, privacy],
+    bottom: [...id.nodes, ...pw.nodes, ...pw2.nodes],
+    check() {
+      if (pw.input.value !== pw2.input.value) throw new Error("비밀번호 두 개가 서로 달라요.");
+    },
+  };
+}
+
+function signupForm(message) {
+  const f = accountFields();
+  const nick = field("nick", "닉네임", { maxlength: 10, placeholder: "예: 떡볶이왕" });
+  const err = el("p", { class: "error", role: "alert" }, message);
+  const btn = el("button", { class: "btn primary big", type: "submit" }, "가입하기");
+  return el("form", { class: "panel join", onsubmit: submitter(btn, err, "가입하기", async () => {
+    f.check();
+    signedIn(await api(null, "/api/signup", { method: "POST", body: {
+      class_name: f.cls.input.value, real_name: f.real.input.value, nickname: nick.input.value,
+      login_id: f.id.input.value, password: f.pw.input.value,
+    } }));
+  }) },
+    el("h2", {}, "회원가입"),
+    ...f.top,
+    ...nick.nodes,
+    el("p", { class: "hint" }, "친구들에게 보이는 이름이에요. 진짜 이름 말고 별명을 써 주세요."),
+    ...f.bottom,
+    rulesBox(),
+    err, btn,
+  );
+}
+
+// 예전에 입장 코드로 들어온 친구: 지금 닉네임과 후기는 그대로 두고 아이디·비밀번호만 만들어요.
+function showMakeAccount(message = "") {
+  stopPolling();
+  showWho();
+  const f = accountFields();
+  const err = el("p", { class: "error", role: "alert" }, message);
+  const btn = el("button", { class: "btn primary big", type: "submit" }, "계정 만들기");
+  appEl.replaceChildren(el("form", { class: "panel join", onsubmit: submitter(btn, err, "계정 만들기", async () => {
+    f.check();
+    await api("student", "/api/me/account", { method: "POST", body: {
+      class_name: f.cls.input.value, real_name: f.real.input.value, login_id: f.id.input.value, password: f.pw.input.value,
+    } });
+    toast("계정을 만들었어요! 다음부터는 아이디로 로그인해요.");
+    showMain();
+  }) },
+    el("h2", {}, "아이디와 비밀번호를 만들어 주세요"),
+    el("p", { class: "hint" }, `이제 입장 코드 대신 로그인으로 들어와요. 닉네임 '${state.nickname}'과 지금까지 남긴 별점·후기는 그대로예요.`),
+    ...f.top, ...f.bottom,
+    err, btn,
+  ));
 }
 
 // ---------- 2. 오늘의 급식 ----------
 
 function showMain() {
-  whoEl.hidden = false;
-  whoEl.textContent = `🙂 ${state.nickname}`;
+  showWho();
   goTo(state.date);
 }
 
@@ -122,8 +218,9 @@ async function refresh() {
     if (err.status === 401) {
       setToken("student", null);
       if (dialogEl.open) dialogEl.close();
-      return showJoin(err.message);
+      return showHome("login", err.message);
     }
+    if (err.status === 403 && !state.menus) return showMakeAccount();
     toast(err.message);
   }
 }
