@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
-    from app.main import app
-    with TestClient(app) as c:
+    from app import main
+    main._login_fails.clear()
+    with TestClient(main.app) as c:
         yield c
