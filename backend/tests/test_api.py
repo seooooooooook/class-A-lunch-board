@@ -371,4 +371,5 @@ def test_pages_served_noindex(client):
     res = client.get("/")
     assert res.status_code == 200 and "오늘의 급식 평가판" in res.text
     assert res.headers["x-robots-tag"] == "noindex, nofollow"
+    assert client.get("/js/app.js").headers["cache-control"] == "no-cache"
     assert client.get("/admin.html").status_code == 200

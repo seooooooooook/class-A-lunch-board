@@ -63,6 +63,8 @@ app = FastAPI(title="오늘의 급식 평가판", lifespan=lifespan)
 async def no_index(request, call_next):
     response = await call_next(request)
     response.headers["X-Robots-Tag"] = "noindex, nofollow"  # 검색 엔진에 나오지 않게
+    # 브라우저가 예전 화면 파일을 붙잡고 있지 않게, 열 때마다 바뀌었는지 확인하게 해요
+    response.headers.setdefault("Cache-Control", "no-cache")
     return response
 
 
